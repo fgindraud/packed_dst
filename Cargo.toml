@@ -1,0 +1,9 @@
+[package]
+name = "packed_dst"
+version = "0.1.0"
+edition = "2021"
+description = "Store a collection of DST (slices and maybe more) in a packed allocation behind a thin box equivalent"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
