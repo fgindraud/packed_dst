@@ -1,100 +1,139 @@
-use std::alloc::Layout;
+#![feature(maybe_uninit_slice)]
+
+use std::alloc::{Layout, LayoutError};
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
-pub struct Box<Descriptor> {
+pub struct Box<Header, Fields: FieldSequence> {
     memory: NonNull<u8>,
-    _type: PhantomData<*mut Descriptor>,
+    _type: PhantomData<*mut (Header, Fields::Metadata)>,
 }
 
+///////////////////////////////////////////////////////////////////////////////
 
+pub trait FieldSequence {
+    type Sizes;
+    type Metadata;
 
-mod old {
-    // Build a repr(C) struct
-    // strategy : extract non DST stuff in repr(Rust) header. header defines size of DST.
-    // build Layout with header + sequence of DST extend. Store offsets.
-    // allocate. fill header and DST arrays.
-    // return a "handle" ; try to make it Box<something> ?
-    // access by deref or something ?
-    use std::alloc::Layout;
-    use std::marker::PhantomData;
-    use std::ops::{Deref, DerefMut};
-    use std::pin::Pin;
-    struct Slice<T> {
-        offset: usize, // From this struct position
-        length: usize,
-        _slice_type: PhantomData<[T]>,
-    }
+    fn extend_layout(
+        layout: &Layout,
+        size: Self::Sizes,
+    ) -> Result<(Layout, Self::Metadata), LayoutError>;
+}
 
-    impl<T> Deref for Slice<T> {
-        type Target = [T];
-        fn deref(&self) -> &Self::Target {
-            unsafe {
-                let slice_descriptor_addr = self.as_ptr().cast::<u8>();
-                let slice_origin_addr = slice_descriptor_addr.wrapping_add(self.offset);
-                std::slice::from_raw_parts(slice_origin_addr.cast(), self.length)
-            }
-        }
-    }
-    impl<T> DerefMut for Slice<T> {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            unsafe {
-                let slice_descriptor_addr = self.as_mut_ptr().cast::<u8>();
-                let slice_origin_addr = slice_descriptor_addr.wrapping_add(self.offset);
-                std::slice::from_raw_parts_mut(slice_origin_addr.cast(), self.length)
-            }
-        }
-    }
+impl<T0: Field, T1: Field> FieldSequence for (T0, T1) {
+    type Sizes = (T0::Size, T1::Size);
+    type Metadata = (T0::MetadataFirst, T1::Metadata);
 
-    impl<T> Slice<T> {
-        const A: usize = 42;
-    }
-
-    struct InlineBuffer<T> {
-        value: usize,
-        buffer: Slice<T>,
-    }
-
-    impl<T: Default> InlineBuffer<T> {
-        fn new(length: usize) -> Pin<Box<Self>> {
-            let layout = Layout::new::<Self>();
-            let (layout, slice_offset) =
-                layout.extend(Layout::array::<T>(length).unwrap()).unwrap();
-            let layout = layout.pad_to_align();
-
-            let mut header = InlineBuffer {
-                value: 42,
-                buffer: Slice {
-                    offset: slice_offset, // FIXME from field
-                    length,
-                    _slice_type: PhantomData,
-                },
-            };
-
-            let header_addr: *const u8 = std::ptr::addr_of!(header).cast();
-            let buffer_addr: *const u8 = std::ptr::addr_of!(header.buffer).cast();
-
-            unsafe {
-                header.buffer.offset -=
-                    usize::try_from(buffer_addr.offset_from(header_addr)).unwrap();
-
-                let memory = std::alloc::alloc(layout);
-                memory.cast::<Self>().write(header);
-                let slice: *mut T = memory.wrapping_add(slice_offset).cast();
-                for i in 0..length {
-                    slice.wrapping_add(i).write(T::default());
-                }
-                Pin::new_unchecked(Box::from_raw(memory.cast()))
-            }
-        }
+    fn extend_layout(
+        layout: &Layout,
+        size: Self::Sizes,
+    ) -> Result<(Layout, Self::Metadata), LayoutError> {
+        let (layout, metadata0) = T0::extend_layout_first(layout, size.0)?;
+        let (layout, metadata1) = T1::extend_layout(&layout, size.1)?;
+        Ok((layout, (metadata0, metadata1)))
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl<T0: Field, T1: Field, T2: Field> FieldSequence for (T0, T1, T2) {
+    type Sizes = (T0::Size, T1::Size, T2::Size);
+    type Metadata = (T0::MetadataFirst, T1::Metadata, T2::Metadata);
 
-    #[test]
-    fn it_works() {
+    fn extend_layout(
+        layout: &Layout,
+        size: Self::Sizes,
+    ) -> Result<(Layout, Self::Metadata), LayoutError> {
+        let (layout, metadata0) = T0::extend_layout_first(layout, size.0)?;
+        let (layout, metadata1) = T1::extend_layout(&layout, size.1)?;
+        let (layout, metadata2) = T2::extend_layout(&layout, size.2)?;
+        Ok((layout, (metadata0, metadata1, metadata2)))
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+pub trait Field {
+    /// Type describing the field size. Passed by value as it is generally Copy.
+    type Size;
+
+    /// Metadata stored alongside the header in the packed DST
+    type Metadata;
+    /// Metadata if the field is the first one. Usually can avoid storing the offset.
+    type MetadataFirst;
+
+    /// Add field to an existing layout
+    fn extend_layout(
+        layout: &Layout,
+        size: Self::Size,
+    ) -> Result<(Layout, Self::Metadata), LayoutError>;
+    /// Add first DST field to existing layout
+    fn extend_layout_first(
+        layout: &Layout,
+        size: Self::Size,
+    ) -> Result<(Layout, Self::MetadataFirst), LayoutError>;
+
+    // Access object by offsetting base ptr. Ties ref on metadata to result !
+    unsafe fn get<'f>(base: *const u8, metadata: &'f Self::Metadata, size: Self::Size) -> &'f Self;
+    unsafe fn get_mut<'f>(
+        base: *mut u8,
+        metadata: &'f mut Self::Metadata,
+        size: Self::Size,
+    ) -> &'f mut Self;
+}
+
+pub struct MaybeUninitSliceMetadata<T> {
+    offset: usize,
+    _slice_type: PhantomData<[MaybeUninit<T>]>,
+}
+
+pub struct MaybeUninitSliceMetadataFirst<T> {
+    _slice_type: PhantomData<[MaybeUninit<T>]>,
+}
+
+impl<T> Field for [MaybeUninit<T>] {
+    type Size = usize;
+    type Metadata = MaybeUninitSliceMetadata<T>;
+    type MetadataFirst = MaybeUninitSliceMetadataFirst<T>;
+
+    fn extend_layout(
+        layout: &Layout,
+        size: Self::Size,
+    ) -> Result<(Layout, Self::Metadata), LayoutError> {
+        let slice = Layout::array::<T>(size)?;
+        let (layout, offset) = layout.extend(slice)?;
+        let metadata = MaybeUninitSliceMetadata {
+            offset,
+            _slice_type: PhantomData,
+        };
+        Ok((layout, metadata))
+    }
+    fn extend_layout_first(
+        layout: &Layout,
+        size: Self::Size,
+    ) -> Result<(Layout, Self::MetadataFirst), LayoutError> {
+        let slice = Layout::array::<T>(size)?;
+        let (layout, _offset) = layout.extend(slice)?;
+        let metadata = MaybeUninitSliceMetadataFirst {
+            _slice_type: PhantomData,
+        };
+        Ok((layout, metadata))
+    }
+
+    unsafe fn get<'f>(base: *const u8, metadata: &'f Self::Metadata, size: Self::Size) -> &'f Self {
+        // Alloc cannot allocate more than isize::MAX
+        let offset = isize::try_from(metadata.offset).unwrap_unchecked();
+        let slice_addr = base.offset(offset);
+        std::slice::from_raw_parts(slice_addr.cast(), size)
+    }
+    unsafe fn get_mut<'f>(
+        base: *mut u8,
+        metadata: &'f mut Self::Metadata,
+        size: Self::Size,
+    ) -> &'f mut Self {
+        // Alloc cannot allocate more than isize::MAX
+        let offset = isize::try_from(metadata.offset).unwrap_unchecked();
+        let slice_addr = base.offset(offset);
+        std::slice::from_raw_parts_mut(slice_addr.cast(), size)
     }
 }
