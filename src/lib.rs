@@ -4,15 +4,15 @@
 
 use std::alloc::{Layout, LayoutError};
 use std::marker::PhantomData;
+use std::ptr::NonNull;
 
-/*
 pub struct Box<Header, Fields: FieldSequence> {
     memory: NonNull<Header>,
     _type: PhantomData<*mut (Header, Fields::Metadata)>,
 }
 
 impl<H, FS: FieldSequence> Box<H, FS> {
-    pub fn new() -> Self {
+    pub fn new<IS: InitializerSequence<FS>>(header: H, initializers: IS) -> Self {
         todo!()
     }
 
@@ -24,56 +24,54 @@ impl<H, FS: FieldSequence> Box<H, FS> {
 ///////////////////////////////////////////////////////////////////////////////
 
 pub trait FieldSequence {
-    type Sizes;
     type Metadata;
-
-    fn extend_layout(
-        layout: &Layout,
-        size: Self::Sizes,
-    ) -> Result<(Layout, Self::Metadata), LayoutError>;
 }
 
-impl<T: FieldDescriptor> FieldSequence for T {
-    type Sizes = T::Size;
-    type Metadata = T::MetadataFirst;
-
-    fn extend_layout(
+pub trait InitializerSequence<Fields>
+where
+    Fields: FieldSequence,
+{
+    fn extend_with_metadata(
+        &self,
         layout: &Layout,
-        size: Self::Sizes,
-    ) -> Result<(Layout, Self::Metadata), LayoutError> {
-        T::extend_layout_first(layout, size)
+    ) -> Result<(Layout, Fields::Metadata), LayoutError>;
+}
+
+impl<F: Field> FieldSequence for F {
+    type Metadata = Metadata<F>;
+}
+impl<F, T> InitializerSequence<F> for T
+where
+    F: Field,
+    T: Initializer<F>,
+{
+    fn extend_with_metadata(
+        &self,
+        layout: &Layout,
+    ) -> Result<(Layout, <F as FieldSequence>::Metadata), LayoutError> {
+        extend_layout_with_metadata(self, layout)
     }
 }
 
-impl<T0: FieldDescriptor, T1: FieldDescriptor> FieldSequence for (T0, T1) {
-    type Sizes = (T0::Size, T1::Size);
-    type Metadata = (T0::MetadataFirst, T1::Metadata);
-
-    fn extend_layout(
+impl<F0: Field, F1: Field> FieldSequence for (F0, F1) {
+    type Metadata = (Metadata<F0>, Metadata<F1>);
+}
+impl<F0, F1, T0, T1> InitializerSequence<(F0, F1)> for (T0, T1)
+where
+    F0: Field,
+    F1: Field,
+    T0: Initializer<F0>,
+    T1: Initializer<F1>,
+{
+    fn extend_with_metadata(
+        &self,
         layout: &Layout,
-        size: Self::Sizes,
-    ) -> Result<(Layout, Self::Metadata), LayoutError> {
-        let (layout, metadata0) = T0::extend_layout_first(layout, size.0)?;
-        let (layout, metadata1) = T1::extend_layout(&layout, size.1)?;
+    ) -> Result<(Layout, <(F0, F1) as FieldSequence>::Metadata), LayoutError> {
+        let (layout, metadata0) = extend_layout_with_metadata(&self.0, layout)?;
+        let (layout, metadata1) = extend_layout_with_metadata(&self.1, &layout)?;
         Ok((layout, (metadata0, metadata1)))
     }
 }
-
-impl<T0: FieldDescriptor, T1: FieldDescriptor, T2: FieldDescriptor> FieldSequence for (T0, T1, T2) {
-    type Sizes = (T0::Size, T1::Size, T2::Size);
-    type Metadata = (T0::MetadataFirst, T1::Metadata, T2::Metadata);
-
-    fn extend_layout(
-        layout: &Layout,
-        size: Self::Sizes,
-    ) -> Result<(Layout, Self::Metadata), LayoutError> {
-        let (layout, metadata0) = T0::extend_layout_first(layout, size.0)?;
-        let (layout, metadata1) = T1::extend_layout(&layout, size.1)?;
-        let (layout, metadata2) = T2::extend_layout(&layout, size.2)?;
-        Ok((layout, (metadata0, metadata1, metadata2)))
-    }
-}
-*/
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -106,7 +104,7 @@ pub struct Metadata<F: ?Sized> {
 }
 impl<F: ?Sized> Metadata<F> {
     /// Offset from base of allocation in bytes.
-    /// 
+    ///
     /// SAFETY: must be a valid metadata attached to a valid packed allocation.
     unsafe fn offset(&self) -> isize {
         // Alloc cannot allocate more than isize::MAX
@@ -115,22 +113,29 @@ impl<F: ?Sized> Metadata<F> {
 }
 
 /// Defines what can initialize a [`Field`].
-/// 
+///
 /// Initialization is split in two steps :
 /// - getting layout and metadata for the packed allocation
 /// - using the values to initialize the fresh allocation at the field offset.
-pub unsafe trait Initializer<F>
-where
-    F: Field,
-{
+pub unsafe trait Initializer<Field> {
     /// Computes the required layout and metadata for the field.
-    fn metadata(&self) -> Result<(Layout, F), LayoutError>;
+    fn metadata(&self) -> Result<(Layout, Field), LayoutError>;
 
     /// Initialize the allocation memory with the content of the initializer.
-    /// 
+    ///
     /// `field_addr` is guaranteed to match the layout requirements of [`Self::metadata`].
     /// It must be initialized by this method.
     unsafe fn initialize_memory(self, field_addr: *mut u8);
+}
+
+fn extend_layout_with_metadata<F, T: Initializer<F>>(
+    initializer: &T,
+    layout: &Layout,
+) -> Result<(Layout, Metadata<F>), LayoutError> {
+    let (field_layout, field) = initializer.metadata()?;
+    let (layout, offset) = layout.extend(field_layout)?;
+    let metadata = Metadata { offset, field };
+    Ok((layout, metadata))
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -196,11 +201,11 @@ where
 ///////////////////////////////////////////////////////////////////////////////
 
 /// Represent a field containing an *unsized* value ([`std::marker::Unsize`]).
-/// 
+///
 /// Can store any value, but this is most useful for storing :
 /// - `dyn Trait` objects
 /// - slices `[T]`, with the limitation that they must be initialized from a fixed length `[T; N]` due to the current unsize machinery
-/// 
+///
 /// Initializers are constrained by what the unsize std machinery supports.
 pub struct Unsized<Dyn> {
     metadata: <Dyn as std::ptr::Pointee>::Metadata,
@@ -229,7 +234,6 @@ unsafe impl<Dyn> Field for Unsized<Dyn> {
 
 unsafe impl<Dyn, T> Initializer<Unsized<Dyn>> for T
 where
-    Unsized<Dyn>: Field,
     T: std::marker::Unsize<Dyn>,
 {
     fn metadata(&self) -> Result<(Layout, Unsized<Dyn>), LayoutError> {
