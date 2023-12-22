@@ -1,13 +1,14 @@
-#![feature(maybe_uninit_slice)]
-#![feature(ptr_metadata)]
 #![feature(trusted_len)]
+#![feature(ptr_metadata)]
 #![feature(unsize)]
 
-use std::alloc::{Layout, LayoutError};
-use std::marker::{PhantomData, Unsize};
-use std::mem::MaybeUninit;
-use std::ptr::{NonNull, Pointee};
+//#![feature(maybe_uninit_slice)]
 
+use std::alloc::{Layout, LayoutError};
+use std::marker::PhantomData;
+use std::mem::MaybeUninit;
+
+/*
 pub struct Box<Header, Fields: FieldSequence> {
     memory: NonNull<Header>,
     _type: PhantomData<*mut (Header, Fields::Metadata)>,
@@ -75,127 +76,87 @@ impl<T0: FieldDescriptor, T1: FieldDescriptor, T2: FieldDescriptor> FieldSequenc
         Ok((layout, (metadata0, metadata1, metadata2)))
     }
 }
+*/
 
 ///////////////////////////////////////////////////////////////////////////////
 
-pub trait FieldDescriptor {
-    /// Type describing the field size. Passed by value as it is generally Copy.
-    type Size;
+pub unsafe trait Field {
+    type Target: ?Sized;
 
-    /// Metadata stored alongside the header in the packed DST
-    type Metadata;
-    /// Metadata if the field is the first one. Usually can avoid storing the offset.
-    type MetadataFirst;
+    // Derefs take the metadata by reference to tie the lifetimes of the header to the DST lifetime.
+    // Safety: base points to start of valid packed allocation to which metadata is attached, and field referenced by metadata has been initialized.
+    unsafe fn deref(metadata: &Metadata<Self>, base: *const u8) -> &Self::Target;
+    unsafe fn deref_mut(metadata: &mut Metadata<Self>, base: *mut u8) -> &mut Self::Target;
+    unsafe fn drop_in_place(metadata: &Metadata<Self>, base: *mut u8);
 
-    /// Add field to an existing layout
-    fn extend_layout(
-        layout: &Layout,
-        size: Self::Size,
-    ) -> Result<(Layout, Self::Metadata), LayoutError>;
-    /// Add first DST field to existing layout
-    fn extend_layout_first(
-        layout: &Layout,
-        size: Self::Size,
-    ) -> Result<(Layout, Self::MetadataFirst), LayoutError>;
-
-    // Access object by offsetting base ptr. Ties ref on metadata to result !
-    unsafe fn get<'f>(base: *const u8, metadata: &'f Self::Metadata, size: Self::Size) -> &'f Self;
-    unsafe fn get_mut<'f>(
-        base: *mut u8,
-        metadata: &'f mut Self::Metadata,
-        size: Self::Size,
-    ) -> &'f mut Self;
+    // TODO add *_first variants with layout offset computation ?
 }
 
-pub struct MaybeUninitSliceMetadata<T> {
+pub struct Metadata<F: ?Sized> {
+    /// Offset of field from base of allocation, in bytes.
     offset: usize,
-    _slice_type: PhantomData<[MaybeUninit<T>]>,
+    /// Field specific metadata.
+    field: F,
 }
-
-pub struct MaybeUninitSliceMetadataFirst<T> {
-    _slice_type: PhantomData<[MaybeUninit<T>]>,
-}
-
-impl<T> FieldDescriptor for [MaybeUninit<T>] {
-    type Size = usize;
-    type Metadata = MaybeUninitSliceMetadata<T>;
-    type MetadataFirst = MaybeUninitSliceMetadataFirst<T>;
-
-    fn extend_layout(
-        layout: &Layout,
-        size: Self::Size,
-    ) -> Result<(Layout, Self::Metadata), LayoutError> {
-        let slice = Layout::array::<T>(size)?;
-        let (layout, offset) = layout.extend(slice)?;
-        let metadata = MaybeUninitSliceMetadata {
-            offset,
-            _slice_type: PhantomData,
-        };
-        Ok((layout, metadata))
-    }
-    fn extend_layout_first(
-        layout: &Layout,
-        size: Self::Size,
-    ) -> Result<(Layout, Self::MetadataFirst), LayoutError> {
-        let slice = Layout::array::<T>(size)?;
-        let (layout, _offset) = layout.extend(slice)?;
-        let metadata = MaybeUninitSliceMetadataFirst {
-            _slice_type: PhantomData,
-        };
-        Ok((layout, metadata))
-    }
-
-    unsafe fn get<'f>(base: *const u8, metadata: &'f Self::Metadata, size: Self::Size) -> &'f Self {
+impl<F: ?Sized> Metadata<F> {
+    // SAFETY: must be a valid metadata attached to a valid packed allocation.
+    unsafe fn offset(&self) -> isize {
         // Alloc cannot allocate more than isize::MAX
-        let offset = isize::try_from(metadata.offset).unwrap_unchecked();
-        let slice_addr = base.offset(offset);
-        std::slice::from_raw_parts(slice_addr.cast(), size)
-    }
-    unsafe fn get_mut<'f>(
-        base: *mut u8,
-        metadata: &'f mut Self::Metadata,
-        size: Self::Size,
-    ) -> &'f mut Self {
-        // Alloc cannot allocate more than isize::MAX
-        let offset = isize::try_from(metadata.offset).unwrap_unchecked();
-        let slice_addr = base.offset(offset);
-        std::slice::from_raw_parts_mut(slice_addr.cast(), size)
+        isize::try_from(self.offset).unwrap_unchecked()
     }
 }
 
-///////////////////////////////////////////////////////////////////////////////
-
-pub trait Descriptor {
-    type Metadata;
-}
-
-pub unsafe trait Initializer<Field>
+pub unsafe trait Initializer<F>
 where
-    Field: Descriptor,
+    F: Field,
 {
-    fn metadata(&self) -> Result<(Layout, Field::Metadata), LayoutError>;
+    fn metadata(&self) -> Result<(Layout, F), LayoutError>;
 
     /// Initialize the allocation memory with the content of the initializer.
     /// The allocation is guaranteed to match the layout requirements returned by [`Self::metadata`].
     unsafe fn initialize_memory(self, allocation: *mut u8);
 }
 
-pub struct Slice<T>(PhantomData<[T]>);
+///////////////////////////////////////////////////////////////////////////////
 
-impl<T> Descriptor for Slice<T> {
-    type Metadata = usize;
+pub struct Slice<T> {
+    length: usize,
+    _type: PhantomData<[T]>,
 }
 
-unsafe impl<T, I> Initializer<Slice<T>> for I
+unsafe impl<T> Field for Slice<T> {
+    type Target = [T];
+
+    unsafe fn deref(metadata: &Metadata<Self>, base: *const u8) -> &Self::Target {
+        std::slice::from_raw_parts(base.offset(metadata.offset()).cast(), metadata.field.length)
+    }
+    unsafe fn deref_mut(metadata: &mut Metadata<Self>, base: *mut u8) -> &mut Self::Target {
+        std::slice::from_raw_parts_mut(base.offset(metadata.offset()).cast(), metadata.field.length)
+    }
+    unsafe fn drop_in_place(metadata: &Metadata<Self>, base: *mut u8) {
+        let slice_addr: *mut T = base.offset(metadata.offset()).cast();
+        let length = isize::try_from(metadata.field.length).unwrap_unchecked(); // Successful alloc => length < isize::MAX
+        for i in 0..length {
+            std::ptr::drop_in_place(slice_addr.offset(i))
+        }
+    }
+}
+
+unsafe impl<T, Iter> Initializer<Slice<T>> for Iter
 where
-    I: std::iter::TrustedLen<Item = T>,
+    Iter: std::iter::TrustedLen<Item = T>,
 {
-    fn metadata(&self) -> Result<(Layout, usize), LayoutError> {
-        let (lower, _higher) = self.size_hint();
+    fn metadata(&self) -> Result<(Layout, Slice<T>), LayoutError> {
         // Final allocation is never 0 due to metadata, so no special case.
         // If the iterator exceeds isize::MAX the final allocation would fail so no need for a size check.
+        let (lower, _higher) = self.size_hint();
         let layout = Layout::array::<T>(lower)?;
-        Ok((layout, lower))
+
+        let metadata = Slice {
+            length: lower,
+            _type: PhantomData,
+        };
+        Ok((layout, metadata))
     }
     unsafe fn initialize_memory(self, allocation: *mut u8) {
         let mut ptr: *mut T = allocation.cast();
@@ -206,20 +167,44 @@ where
     }
 }
 
-pub struct Unsized<Dyn>(PhantomData<Dyn>);
+///////////////////////////////////////////////////////////////////////////////
 
-impl<Dyn> Descriptor for Unsized<Dyn> {
-    type Metadata = <Dyn as Pointee>::Metadata;
+pub struct Unsized<Dyn> {
+    metadata: <Dyn as std::ptr::Pointee>::Metadata,
+    _type: PhantomData<Dyn>,
+}
+
+unsafe impl<Dyn> Field for Unsized<Dyn> {
+    type Target = Dyn;
+    unsafe fn deref(metadata: &Metadata<Self>, base: *const u8) -> &Self::Target {
+        let value_addr = base.offset(metadata.offset());
+        let ptr = std::ptr::from_raw_parts(value_addr.cast(), metadata.field.metadata);
+        &*ptr
+    }
+    unsafe fn deref_mut(metadata: &mut Metadata<Self>, base: *mut u8) -> &mut Self::Target {
+        let value_addr = base.offset(metadata.offset());
+        let ptr = std::ptr::from_raw_parts_mut(value_addr.cast(), metadata.field.metadata);
+        &mut *ptr
+    }
+    unsafe fn drop_in_place(metadata: &Metadata<Self>, base: *mut u8) {
+        let value_addr = base.offset(metadata.offset());
+        let ptr = std::ptr::from_raw_parts_mut(value_addr.cast(), metadata.field.metadata);
+        std::ptr::drop_in_place::<Dyn>(ptr) // May call the vtable drop if actual Dyn type
+    }
 }
 
 unsafe impl<Dyn, T> Initializer<Unsized<Dyn>> for T
 where
-    T: Unsize<Dyn>,
-    Unsized<Dyn>: Descriptor<Metadata = <Dyn as Pointee>::Metadata>,
+    Unsized<Dyn>: Field,
+    T: std::marker::Unsize<Dyn>,
 {
-    fn metadata(&self) -> Result<(Layout, <Unsized<Dyn> as Descriptor>::Metadata), LayoutError> {
+    fn metadata(&self) -> Result<(Layout, Unsized<Dyn>), LayoutError> {
         let layout = Layout::for_value(self);
         let metadata = std::ptr::metadata(self as &Dyn);
+        let metadata = Unsized {
+            metadata,
+            _type: PhantomData,
+        };
         Ok((layout, metadata))
     }
     unsafe fn initialize_memory(self, allocation: *mut u8) {
