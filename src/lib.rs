@@ -2,11 +2,8 @@
 #![feature(ptr_metadata)]
 #![feature(unsize)]
 
-//#![feature(maybe_uninit_slice)]
-
 use std::alloc::{Layout, LayoutError};
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
 
 /*
 pub struct Box<Header, Fields: FieldSequence> {
@@ -80,7 +77,15 @@ impl<T0: FieldDescriptor, T1: FieldDescriptor, T2: FieldDescriptor> FieldSequenc
 
 ///////////////////////////////////////////////////////////////////////////////
 
+/// Indicates that a metadata type can represent a DST field.
+///
+/// [`Self`] in this case is the field specific metadata : slice length, `dyn` vtable.
+/// It is created from various initializers defined by the [`Initializer`] trait.
+///
+/// This trait is unsafe to implement, as packed DST containers will use its functions assuming invariants are met.
+/// The functions themselves are unsafe due to creating reference to the DST field from raw pointers.
 pub unsafe trait Field {
+    /// Type stored in the field, can be a DST : `[T]`, `dyn Trait`.
     type Target: ?Sized;
 
     // Derefs take the metadata by reference to tie the lifetimes of the header to the DST lifetime.
@@ -92,6 +97,7 @@ pub unsafe trait Field {
     // TODO add *_first variants with layout offset computation ?
 }
 
+/// Complete metadata for a [`Field`] : ties the field metadata with its offset.
 pub struct Metadata<F: ?Sized> {
     /// Offset of field from base of allocation, in bytes.
     offset: usize,
@@ -99,26 +105,42 @@ pub struct Metadata<F: ?Sized> {
     field: F,
 }
 impl<F: ?Sized> Metadata<F> {
-    // SAFETY: must be a valid metadata attached to a valid packed allocation.
+    /// Offset from base of allocation in bytes.
+    /// 
+    /// SAFETY: must be a valid metadata attached to a valid packed allocation.
     unsafe fn offset(&self) -> isize {
         // Alloc cannot allocate more than isize::MAX
         isize::try_from(self.offset).unwrap_unchecked()
     }
 }
 
+/// Defines what can initialize a [`Field`].
+/// 
+/// Initialization is split in two steps :
+/// - getting layout and metadata for the packed allocation
+/// - using the values to initialize the fresh allocation at the field offset.
 pub unsafe trait Initializer<F>
 where
     F: Field,
 {
+    /// Computes the required layout and metadata for the field.
     fn metadata(&self) -> Result<(Layout, F), LayoutError>;
 
     /// Initialize the allocation memory with the content of the initializer.
-    /// The allocation is guaranteed to match the layout requirements returned by [`Self::metadata`].
-    unsafe fn initialize_memory(self, allocation: *mut u8);
+    /// 
+    /// `field_addr` is guaranteed to match the layout requirements of [`Self::metadata`].
+    /// It must be initialized by this method.
+    unsafe fn initialize_memory(self, field_addr: *mut u8);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
+/// Represents a field containing a [`std::slice`] `[T]` of dynamic length.
+///
+/// Slices must be initialized with a fixed length iterator of `T` values ([`std::iter::TrustedLen`]).
+///
+/// Partial initialization can be achieved using a slice of [`std::mem::MaybeUninit`], initialized to `uninit()`.
+/// This means adding a safe interface on top to implement something akin to [`Vec`] with data inline to header.
 pub struct Slice<T> {
     length: usize,
     _type: PhantomData<[T]>,
@@ -158,8 +180,8 @@ where
         };
         Ok((layout, metadata))
     }
-    unsafe fn initialize_memory(self, allocation: *mut u8) {
-        let mut ptr: *mut T = allocation.cast();
+    unsafe fn initialize_memory(self, field_addr: *mut u8) {
+        let mut ptr: *mut T = field_addr.cast();
         for v in self {
             ptr.write(v);
             ptr = ptr.offset(1);
@@ -169,6 +191,17 @@ where
 
 ///////////////////////////////////////////////////////////////////////////////
 
+// TODO str support
+
+///////////////////////////////////////////////////////////////////////////////
+
+/// Represent a field containing an *unsized* value ([`std::marker::Unsize`]).
+/// 
+/// Can store any value, but this is most useful for storing :
+/// - `dyn Trait` objects
+/// - slices `[T]`, with the limitation that they must be initialized from a fixed length `[T; N]` due to the current unsize machinery
+/// 
+/// Initializers are constrained by what the unsize std machinery supports.
 pub struct Unsized<Dyn> {
     metadata: <Dyn as std::ptr::Pointee>::Metadata,
     _type: PhantomData<Dyn>,
@@ -176,6 +209,7 @@ pub struct Unsized<Dyn> {
 
 unsafe impl<Dyn> Field for Unsized<Dyn> {
     type Target = Dyn;
+
     unsafe fn deref(metadata: &Metadata<Self>, base: *const u8) -> &Self::Target {
         let value_addr = base.offset(metadata.offset());
         let ptr = std::ptr::from_raw_parts(value_addr.cast(), metadata.field.metadata);
@@ -189,7 +223,7 @@ unsafe impl<Dyn> Field for Unsized<Dyn> {
     unsafe fn drop_in_place(metadata: &Metadata<Self>, base: *mut u8) {
         let value_addr = base.offset(metadata.offset());
         let ptr = std::ptr::from_raw_parts_mut(value_addr.cast(), metadata.field.metadata);
-        std::ptr::drop_in_place::<Dyn>(ptr) // May call the vtable drop if actual Dyn type
+        std::ptr::drop_in_place::<Dyn>(ptr) // Will call the vtable drop if actual dyn Trait
     }
 }
 
@@ -207,8 +241,8 @@ where
         };
         Ok((layout, metadata))
     }
-    unsafe fn initialize_memory(self, allocation: *mut u8) {
-        let ptr: *mut T = allocation.cast();
+    unsafe fn initialize_memory(self, field_addr: *mut u8) {
+        let ptr: *mut T = field_addr.cast();
         ptr.write(self)
     }
 }
