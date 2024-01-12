@@ -138,6 +138,7 @@ pub unsafe trait Field {
     unsafe fn drop_in_place(metadata: &mut Metadata<Self>, base: *mut u8);
 
     // TODO add *_first variants with layout offset computation ?
+    // FIXME is drop_in_place necessary as it is always drop_in_place(deref_mut()) ?
 }
 
 /// Complete metadata for a [`Field`] : ties the field metadata with its offset.
@@ -206,11 +207,8 @@ unsafe impl<T> Field for Slice<T> {
         std::slice::from_raw_parts_mut(base.offset(metadata.offset()).cast(), metadata.field.length)
     }
     unsafe fn drop_in_place(metadata: &mut Metadata<Self>, base: *mut u8) {
-        let slice_addr: *mut T = base.offset(metadata.offset()).cast();
-        let length = isize::try_from(metadata.field.length).unwrap_unchecked(); // Successful alloc => length < isize::MAX
-        for i in 0..length {
-            std::ptr::drop_in_place(slice_addr.offset(i))
-        }
+        // std::vec::Vec uses drop_in_place on the slice
+        std::ptr::drop_in_place(Field::deref_mut(metadata, base));
     }
 }
 
@@ -241,15 +239,55 @@ where
 
 ///////////////////////////////////////////////////////////////////////////////
 
-// TODO str support
+/// Represent a field containing a [`String`] data.
+///
+/// Must be initialized by copying data from a [`&str`].
+pub struct Str {
+    length: usize,
+    _type: PhantomData<str>, // only for type classification as DST-like
+}
+
+unsafe impl Field for Str {
+    type Target = str;
+
+    unsafe fn deref(metadata: &Metadata<Self>, base: *const u8) -> &Self::Target {
+        let s = std::slice::from_raw_parts(base.offset(metadata.offset()), metadata.field.length);
+        std::str::from_utf8_unchecked(s)
+    }
+    unsafe fn deref_mut(metadata: &mut Metadata<Self>, base: *mut u8) -> &mut Self::Target {
+        let s =
+            std::slice::from_raw_parts_mut(base.offset(metadata.offset()), metadata.field.length);
+        std::str::from_utf8_unchecked_mut(s)
+    }
+    unsafe fn drop_in_place(metadata: &mut Metadata<Self>, base: *mut u8) {
+        // Use drop_in_place from str, should do nothing
+        std::ptr::drop_in_place(Field::deref_mut(metadata, base))
+    }
+}
+
+unsafe impl Initializer<Str> for &'_ str {
+    fn metadata(&self) -> Result<(Layout, Str), LayoutError> {
+        let length = self.len();
+        let layout = Layout::array::<u8>(length)?;
+        let metadata = Str {
+            length,
+            _type: PhantomData,
+        };
+        Ok((layout, metadata))
+    }
+    unsafe fn initialize_memory(self, field_addr: *mut u8) {
+        std::ptr::copy_nonoverlapping(self.as_ptr(), field_addr, self.len())
+    }
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 
 /// Represent a field containing an *unsized* value ([`std::marker::Unsize`]).
 ///
 /// Can store any value, but this is most useful for storing :
-/// - `dyn Trait` objects
-/// - slices `[T]`, with the limitation that they must be initialized from a fixed length `[T; N]` due to the current unsize machinery
+/// - `dyn Trait` objects initialized from a concrete value
+/// - slices `[T]`, that must be initialized from a fixed length `[T; N]` due to the current unsize machinery
+/// - [`str`], but what are the initializers ?
 ///
 /// Initializers are constrained by what the unsize std machinery supports.
 pub struct Unsized<Dyn> {
@@ -271,9 +309,8 @@ unsafe impl<Dyn> Field for Unsized<Dyn> {
         &mut *ptr
     }
     unsafe fn drop_in_place(metadata: &mut Metadata<Self>, base: *mut u8) {
-        let value_addr = base.offset(metadata.offset());
-        let ptr = std::ptr::from_raw_parts_mut(value_addr.cast(), metadata.field.metadata);
-        std::ptr::drop_in_place::<Dyn>(ptr) // Will call the vtable drop if actual dyn Trait
+        // Delegate to drop for Dyn. Will call the vtable if necessary.
+        std::ptr::drop_in_place(Field::deref_mut(metadata, base))
     }
 }
 
