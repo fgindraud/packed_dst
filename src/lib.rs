@@ -23,8 +23,23 @@ impl<H, FS: FieldSequence> Box<H, FS> {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+/// Represent a sequence of concatenated fields
 pub trait FieldSequence {
+    /// Compound metadata for the sequence (tuple of metadata usually).
     type Metadata;
+
+    /// Tuple of references to fields
+    type Ref<'m>
+    where
+        Self: 'm;
+    /// Tuple of mut references to fields
+    type RefMut<'m>
+    where
+        Self: 'm;
+
+    unsafe fn deref(metadata: &Self::Metadata, base: *const u8) -> Self::Ref<'_>;
+    unsafe fn deref_mut(metadata: &mut Self::Metadata, base: *mut u8) -> Self::RefMut<'_>;
+    unsafe fn drop_in_place(metadata: &mut Self::Metadata, base: *mut u8);
 }
 
 pub trait InitializerSequence<Fields>
@@ -37,8 +52,21 @@ where
     ) -> Result<(Layout, Fields::Metadata), LayoutError>;
 }
 
+// T
 impl<F: Field> FieldSequence for F {
     type Metadata = Metadata<F>;
+    type Ref<'m> = &'m F::Target where Self: 'm;
+    type RefMut<'m> = &'m mut F::Target where Self: 'm;
+
+    unsafe fn deref(metadata: &Self::Metadata, base: *const u8) -> Self::Ref<'_> {
+        Field::deref(metadata, base)
+    }
+    unsafe fn deref_mut(metadata: &mut Self::Metadata, base: *mut u8) -> Self::RefMut<'_> {
+        Field::deref_mut(metadata, base)
+    }
+    unsafe fn drop_in_place(metadata: &mut Self::Metadata, base: *mut u8) {
+        Field::drop_in_place(metadata, base)
+    }
 }
 impl<F, T> InitializerSequence<F> for T
 where
@@ -53,8 +81,25 @@ where
     }
 }
 
+// (T0, T1)
 impl<F0: Field, F1: Field> FieldSequence for (F0, F1) {
     type Metadata = (Metadata<F0>, Metadata<F1>);
+    type Ref<'m> = (&'m F0::Target, &'m F1::Target) where Self: 'm;
+    type RefMut<'m> = (&'m mut F0::Target, &'m mut F1::Target) where Self: 'm;
+
+    unsafe fn deref(metadata: &Self::Metadata, base: *const u8) -> Self::Ref<'_> {
+        (F0::deref(&metadata.0, base), F1::deref(&metadata.1, base))
+    }
+    unsafe fn deref_mut(metadata: &mut Self::Metadata, base: *mut u8) -> Self::RefMut<'_> {
+        (
+            F0::deref_mut(&mut metadata.0, base),
+            F1::deref_mut(&mut metadata.1, base),
+        )
+    }
+    unsafe fn drop_in_place(metadata: &mut Self::Metadata, base: *mut u8) {
+        Field::drop_in_place(&mut metadata.0, base);
+        Field::drop_in_place(&mut metadata.1, base);
+    }
 }
 impl<F0, F1, T0, T1> InitializerSequence<(F0, F1)> for (T0, T1)
 where
@@ -90,7 +135,7 @@ pub unsafe trait Field {
     // Safety: base points to start of valid packed allocation to which metadata is attached, and field referenced by metadata has been initialized.
     unsafe fn deref(metadata: &Metadata<Self>, base: *const u8) -> &Self::Target;
     unsafe fn deref_mut(metadata: &mut Metadata<Self>, base: *mut u8) -> &mut Self::Target;
-    unsafe fn drop_in_place(metadata: &Metadata<Self>, base: *mut u8);
+    unsafe fn drop_in_place(metadata: &mut Metadata<Self>, base: *mut u8);
 
     // TODO add *_first variants with layout offset computation ?
 }
@@ -160,7 +205,7 @@ unsafe impl<T> Field for Slice<T> {
     unsafe fn deref_mut(metadata: &mut Metadata<Self>, base: *mut u8) -> &mut Self::Target {
         std::slice::from_raw_parts_mut(base.offset(metadata.offset()).cast(), metadata.field.length)
     }
-    unsafe fn drop_in_place(metadata: &Metadata<Self>, base: *mut u8) {
+    unsafe fn drop_in_place(metadata: &mut Metadata<Self>, base: *mut u8) {
         let slice_addr: *mut T = base.offset(metadata.offset()).cast();
         let length = isize::try_from(metadata.field.length).unwrap_unchecked(); // Successful alloc => length < isize::MAX
         for i in 0..length {
@@ -225,7 +270,7 @@ unsafe impl<Dyn> Field for Unsized<Dyn> {
         let ptr = std::ptr::from_raw_parts_mut(value_addr.cast(), metadata.field.metadata);
         &mut *ptr
     }
-    unsafe fn drop_in_place(metadata: &Metadata<Self>, base: *mut u8) {
+    unsafe fn drop_in_place(metadata: &mut Metadata<Self>, base: *mut u8) {
         let value_addr = base.offset(metadata.offset());
         let ptr = std::ptr::from_raw_parts_mut(value_addr.cast(), metadata.field.metadata);
         std::ptr::drop_in_place::<Dyn>(ptr) // Will call the vtable drop if actual dyn Trait
