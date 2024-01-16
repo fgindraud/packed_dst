@@ -5,10 +5,12 @@
 
 use std::alloc::{Layout, LayoutError};
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 pub struct Box<Fields: FieldSequence> {
-    memory: NonNull<Fields::Metadata>,
+    /// Points to header with metadata. DST fields follow in repr C layout.
+    packed_allocation: NonNull<Fields::Metadata>,
 }
 
 impl<FS: FieldSequence> Box<FS> {
@@ -17,35 +19,42 @@ impl<FS: FieldSequence> Box<FS> {
         unsafe {
             let base = std::alloc::alloc(layout);
             let base = NonNull::new(base).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
-            initializers.initialize_fields(base.as_ptr(), &metadata);
-            let memory = base.cast::<FS::Metadata>();
-            memory.as_ptr().write(metadata);
-            Ok(Box { memory })
+            let mut header = base.cast::<FS::Metadata>();
+            // From there to Box all operations are moves. No panic should occur.
+            header.as_ptr().write(metadata);
+            initializers.initialize_fields(base.as_ptr(), header.as_mut());
+            Ok(Box {
+                packed_allocation: header,
+            })
         }
     }
 
     pub fn fields(&self) -> FS::Ref<'_> {
         unsafe {
-            let base = self.memory.as_ptr().cast();
-            FS::deref(self.memory.as_ref(), base)
+            let base = self.packed_allocation.as_ptr().cast();
+            FS::deref(self.packed_allocation.as_ref(), base)
         }
     }
 
     pub fn fields_mut(&mut self) -> FS::RefMut<'_> {
         unsafe {
-            let base = self.memory.as_ptr().cast();
-            FS::deref_mut(self.memory.as_mut(), base)
+            let base = self.packed_allocation.as_ptr().cast();
+            FS::deref_mut(self.packed_allocation.as_mut(), base)
         }
+    }
+
+    pub fn layout(&self) -> Layout {
+        unsafe { FS::layout(self.packed_allocation.as_ref()) }
     }
 }
 
 impl<FS: FieldSequence> Drop for Box<FS> {
     fn drop(&mut self) {
         unsafe {
-            let layout = FS::layout(self.memory.as_ref());
-            let base = self.memory.as_ptr().cast();
-            FS::drop_in_place(self.memory.as_mut(), base);
-            std::ptr::drop_in_place(self.memory.as_ptr()); // Metadata block
+            let layout = FS::layout(self.packed_allocation.as_ref());
+            let base = self.packed_allocation.as_ptr().cast();
+            FS::drop_in_place(self.packed_allocation.as_mut(), base);
+            std::ptr::drop_in_place(self.packed_allocation.as_ptr()); // Metadata block
             std::alloc::dealloc(base, layout)
         }
     }
@@ -86,11 +95,11 @@ pub unsafe trait FieldSequence {
 /// Represent a sequence of initializer that can initialize a [`FieldSequence`]
 pub unsafe trait InitializerSequence<Fields: FieldSequence> {
     /// Compute the packed [`Layout`] and the set of field [`FieldSequence::Metadata`].
-    /// 
+    ///
     /// SAFETY: layout must match with [`FieldSequence::layout`] on the returned metadata.
     fn pack_fields(&self) -> Result<(Layout, Fields::Metadata), LayoutError>;
 
-    unsafe fn initialize_fields(self, base: *mut u8, metadata: &Fields::Metadata);
+    unsafe fn initialize_fields(self, base: *mut u8, metadata: &mut Fields::Metadata);
 }
 
 // T
@@ -128,7 +137,11 @@ where
         Ok((layout.pad_to_align(), metadata))
     }
 
-    unsafe fn initialize_fields(self, base: *mut u8, metadata: &<F as FieldSequence>::Metadata) {
+    unsafe fn initialize_fields(
+        self,
+        base: *mut u8,
+        metadata: &mut <F as FieldSequence>::Metadata,
+    ) {
         metadata.initialize_field(base, self)
     }
 }
@@ -176,7 +189,7 @@ where
     unsafe fn initialize_fields(
         self,
         base: *mut u8,
-        metadata: &<(F0, F1) as FieldSequence>::Metadata,
+        metadata: &mut <(F0, F1) as FieldSequence>::Metadata,
     ) {
         metadata.0.initialize_field(base, self.0);
         metadata.1.initialize_field(base, self.1)
@@ -185,7 +198,7 @@ where
 
 ///////////////////////////////////////////////////////////////////////////////
 
-/// Indicates that a metadata type can represent a DST field.
+/// Indicates that a *descriptor* type can represent a DST field.
 ///
 /// [`Self`] in this case is the field specific metadata : slice length, `dyn` vtable.
 /// It is created from various initializers defined by the [`Initializer`] trait.
@@ -195,7 +208,7 @@ where
 /// The functions themselves are unsafe due to creating reference to the DST field from raw pointers.
 pub unsafe trait Field {
     /// Type stored in the field, can be a DST : `[T]`, `dyn Trait`.
-    type Target: ?Sized;
+    type Target: ?std::marker::Sized;
 
     /// Field [`Layout``] in memory
     fn layout(&self) -> Layout;
@@ -220,7 +233,7 @@ pub unsafe trait Initializer<Field> {
     /// Initialize the allocation memory with the content of the initializer.
     ///
     /// SAFETY: `field_addr` must match the layout requirements of [`Self::analyze`].
-    unsafe fn initialize(self, field_addr: *mut u8);
+    unsafe fn initialize(self, field_addr: *mut u8, descriptor: &mut Field);
 }
 
 /// Complete metadata for a [`Field`] : ties the field metadata with its offset.
@@ -243,9 +256,9 @@ impl<F> Metadata<F> {
     }
 
     // SAFETY: base must have the right layout at offset for initialization.
-    unsafe fn initialize_field<T: Initializer<F>>(&self, base: *mut u8, initializer: T) {
+    unsafe fn initialize_field<T: Initializer<F>>(&mut self, base: *mut u8, initializer: T) {
         let field_addr = base.offset(self.offset());
-        initializer.initialize(field_addr)
+        initializer.initialize(field_addr, &mut self.field)
     }
 }
 
@@ -263,7 +276,7 @@ impl<F: Field> Metadata<F> {
     }
     unsafe fn drop_in_place(&mut self, base: *mut u8) {
         // For all covered DST ([T], str, dyn trait) we can use drop_in_place(*mut DST).
-        // It can be added to the Field trait in case of specialized behavior.
+        // Also works on Sized as deref_mut points to the MaybeUninit.
         std::ptr::drop_in_place(self.deref_mut(base));
     }
 }
@@ -280,6 +293,48 @@ where
     let (layout, offset) = layout.extend(field.layout())?;
     let metadata = Metadata { offset, field };
     Ok((layout, metadata))
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+/// Represent a normal sized field.
+pub struct Sized<T> {
+    /// Store the sized field in metadata header and keep DST field zero sized.
+    /// This enable Rust layout optimizations to work, and automatically packs sized fields at the front.
+    ///
+    /// - starts uninit at [`Initializer::analyze`]
+    /// - copied as uninit in the allocation
+    /// - initialized during [`Initializer::initialize`]
+    /// - can be safely deref if successful using [`MaybeUninit::assume_init_ref`] (and mut)
+    /// - will be dropped by [`std::ptr::drop_in_place`] on [`Field::deref_mut`] like others, no special case needed
+    value: MaybeUninit<T>,
+}
+
+unsafe impl<T> Field for Sized<T> {
+    type Target = T;
+
+    fn layout(&self) -> Layout {
+        // Actual DST field is zero sized.
+        Layout::new::<()>()
+    }
+
+    unsafe fn deref(&self, _field_addr: *const u8) -> &Self::Target {
+        self.value.assume_init_ref()
+    }
+    unsafe fn deref_mut(&mut self, _field_addr: *mut u8) -> &mut Self::Target {
+        self.value.assume_init_mut()
+    }
+}
+
+unsafe impl<T> Initializer<Sized<T>> for T {
+    fn analyze(&self) -> Result<Sized<T>, LayoutError> {
+        Ok(Sized {
+            value: MaybeUninit::uninit(),
+        })
+    }
+    unsafe fn initialize(self, _field_addr: *mut u8, descriptor: &mut Sized<T>) {
+        descriptor.value.write(self);
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -325,12 +380,14 @@ where
             _type: PhantomData,
         })
     }
-    unsafe fn initialize(self, field_addr: *mut u8) {
-        let mut ptr: *mut T = field_addr.cast();
+    unsafe fn initialize(self, field_addr: *mut u8, descriptor: &mut Slice<T>) {
+        let base: *mut T = field_addr.cast();
+        let mut ptr = base;
         for v in self {
             ptr.write(v);
             ptr = ptr.offset(1);
         }
+        debug_assert_eq!(base.offset(descriptor.length as isize), ptr);
     }
 }
 
@@ -371,7 +428,8 @@ unsafe impl Initializer<Str> for &'_ str {
             _type: PhantomData,
         })
     }
-    unsafe fn initialize(self, field_addr: *mut u8) {
+    unsafe fn initialize(self, field_addr: *mut u8, descriptor: &mut Str) {
+        debug_assert_eq!(descriptor.length, self.len());
         std::ptr::copy_nonoverlapping(self.as_ptr(), field_addr, self.len())
     }
 }
@@ -386,12 +444,12 @@ unsafe impl Initializer<Str> for &'_ str {
 /// - [`str`], but what are the initializers ?
 ///
 /// Initializers are constrained by what the unsize std machinery supports.
-pub struct Unsized<Dyn: ?Sized> {
+pub struct Unsized<Dyn: ?std::marker::Sized> {
     metadata: <Dyn as std::ptr::Pointee>::Metadata,
     _type: PhantomData<Dyn>,
 }
 
-unsafe impl<Dyn: ?Sized> Field for Unsized<Dyn> {
+unsafe impl<Dyn: ?std::marker::Sized> Field for Unsized<Dyn> {
     type Target = Dyn;
 
     fn layout(&self) -> Layout {
@@ -414,7 +472,7 @@ unsafe impl<Dyn: ?Sized> Field for Unsized<Dyn> {
 
 unsafe impl<Dyn, T> Initializer<Unsized<Dyn>> for T
 where
-    Dyn: ?Sized,
+    Dyn: ?std::marker::Sized,
     T: std::marker::Unsize<Dyn>,
 {
     fn analyze(&self) -> Result<Unsized<Dyn>, LayoutError> {
@@ -425,7 +483,7 @@ where
             _type: PhantomData,
         })
     }
-    unsafe fn initialize(self, field_addr: *mut u8) {
+    unsafe fn initialize(self, field_addr: *mut u8, _descriptor: &mut Unsized<Dyn>) {
         let ptr: *mut T = field_addr.cast();
         ptr.write(self)
     }
@@ -435,11 +493,31 @@ where
 
 #[test]
 fn test() {
-    let mut b: Box<(Slice<usize>, Unsized<dyn AsRef<str>>)> =
+    let mut dst: Box<(Slice<usize>, Unsized<dyn AsRef<str>>)> =
         Box::new(([42, 43].into_iter(), "blah")).unwrap();
-    let (slice, string) = b.fields();
+    let (slice, string) = dst.fields();
     assert_eq!(slice, &[42, 43]);
     assert_eq!(string.as_ref(), "blah");
-    b.fields_mut().0.into_iter().for_each(|i| *i += 1);
-    assert_eq!(b.fields().0, &[43, 44]);
+    dst.fields_mut().0.into_iter().for_each(|i| *i += 1);
+    assert_eq!(dst.fields().0, &[43, 44]);
+
+    let mut sized = Box::<Sized<Vec<usize>>>::new(vec![42, 43]).unwrap();
+    sized.fields_mut()[0] = 0;
+    assert_eq!(sized.fields(), &[0, 43]);
+
+    let zst = Box::<Sized<()>>::new(()).unwrap(); // FIXME will fail if static offset optim
+
+    // layouts
+    assert_eq!(
+        dst.layout(),
+        Layout::array::<usize>(2 /*offsets*/ + 1 + 2 /*slice*/ + 1 + 2 /*dyn str*/).unwrap()
+    );
+    assert_eq!(
+        sized.layout(),
+        Layout::array::<usize>(1 /*offset*/ + 3 /*vec*/).unwrap()
+    );
+    assert_eq!(
+        zst.layout(),
+        Layout::array::<usize>(1 /*offset*/).unwrap()
+    )
 }
