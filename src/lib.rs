@@ -13,7 +13,7 @@ pub struct Box<Fields: FieldSequence> {
 
 impl<FS: FieldSequence> Box<FS> {
     pub fn new<IS: InitializerSequence<FS>>(initializers: IS) -> Result<Self, LayoutError> {
-        let (layout, metadata) = initializers.analyze_fields()?;
+        let (layout, metadata) = initializers.pack_fields()?;
         unsafe {
             let base = std::alloc::alloc(layout);
             let base = NonNull::new(base).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
@@ -53,21 +53,31 @@ impl<FS: FieldSequence> Drop for Box<FS> {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-/// Represent a sequence of concatenated fields
+/// Represent a sequence of concatenated fields.
+///
+/// This defines the metadata and field operations for the whole packed DST bundle.
+/// This trait is already implemented for [`tuple`] of various sizes.
+///
+/// It can be implemented on custom structs for a nicer interface, but requires unsafe.
+/// A better extension strategy is to make a wrapper around [`Box`] with the needed types.
 pub unsafe trait FieldSequence {
     /// Compound metadata for the sequence (tuple of metadata usually).
     type Metadata;
 
-    /// Tuple of references to fields
+    /// References to fields (usually packed in a tuple)
     type Ref<'m>
     where
         Self: 'm;
-    /// Tuple of mut references to fields
+    /// `mut` references to fields (usually packed in a tuple)
     type RefMut<'m>
     where
         Self: 'm;
 
+    /// Allocation layout for packed field sequence and metadata header
+    ///
+    /// SAFETY: must match layout from [`InitializerSequence::pack_fields`]
     fn layout(metadata: &Self::Metadata) -> Layout;
+
     unsafe fn deref(metadata: &Self::Metadata, base: *const u8) -> Self::Ref<'_>;
     unsafe fn deref_mut(metadata: &mut Self::Metadata, base: *mut u8) -> Self::RefMut<'_>;
     unsafe fn drop_in_place(metadata: &mut Self::Metadata, base: *mut u8);
@@ -75,7 +85,10 @@ pub unsafe trait FieldSequence {
 
 /// Represent a sequence of initializer that can initialize a [`FieldSequence`]
 pub unsafe trait InitializerSequence<Fields: FieldSequence> {
-    fn analyze_fields(&self) -> Result<(Layout, Fields::Metadata), LayoutError>;
+    /// Compute the packed [`Layout`] and the set of field [`FieldSequence::Metadata`].
+    /// 
+    /// SAFETY: layout must match with [`FieldSequence::layout`] on the returned metadata.
+    fn pack_fields(&self) -> Result<(Layout, Fields::Metadata), LayoutError>;
 
     unsafe fn initialize_fields(self, base: *mut u8, metadata: &Fields::Metadata);
 }
@@ -87,6 +100,7 @@ unsafe impl<F: Field> FieldSequence for F {
     type RefMut<'m> = &'m mut F::Target where Self: 'm;
 
     fn layout(metadata: &Self::Metadata) -> Layout {
+        // SAFETY: successfully computed once if metadata exists.
         unsafe {
             let layout = Layout::new::<<F as FieldSequence>::Metadata>();
             let (layout, _) = layout.extend(metadata.field.layout()).unwrap_unchecked();
@@ -108,7 +122,7 @@ where
     F: Field,
     T: Initializer<F>,
 {
-    fn analyze_fields(&self) -> Result<(Layout, <F as FieldSequence>::Metadata), LayoutError> {
+    fn pack_fields(&self) -> Result<(Layout, <F as FieldSequence>::Metadata), LayoutError> {
         let layout = Layout::new::<<F as FieldSequence>::Metadata>();
         let (layout, metadata) = extend_layout_with_field(self, &layout)?;
         Ok((layout.pad_to_align(), metadata))
@@ -126,6 +140,7 @@ unsafe impl<F0: Field, F1: Field> FieldSequence for (F0, F1) {
     type RefMut<'m> = (&'m mut F0::Target, &'m mut F1::Target) where Self: 'm;
 
     fn layout(metadata: &Self::Metadata) -> Layout {
+        // SAFETY: successfully computed once if metadata exists.
         unsafe {
             let layout = Layout::new::<<(F0, F1) as FieldSequence>::Metadata>();
             let (layout, _) = layout.extend(metadata.0.field.layout()).unwrap_unchecked();
@@ -151,9 +166,7 @@ where
     T0: Initializer<F0>,
     T1: Initializer<F1>,
 {
-    fn analyze_fields(
-        &self,
-    ) -> Result<(Layout, <(F0, F1) as FieldSequence>::Metadata), LayoutError> {
+    fn pack_fields(&self) -> Result<(Layout, <(F0, F1) as FieldSequence>::Metadata), LayoutError> {
         let layout = Layout::new::<<(F0, F1) as FieldSequence>::Metadata>();
         let (layout, metadata0) = extend_layout_with_field(&self.0, &layout)?;
         let (layout, metadata1) = extend_layout_with_field(&self.1, &layout)?;
@@ -184,7 +197,7 @@ pub unsafe trait Field {
     /// Type stored in the field, can be a DST : `[T]`, `dyn Trait`.
     type Target: ?Sized;
 
-    /// Field layout from metadata
+    /// Field [`Layout``] in memory
     fn layout(&self) -> Layout;
 
     /// Derefs take the metadata by reference to tie the lifetimes of the header to the DST lifetime.
@@ -200,8 +213,9 @@ pub unsafe trait Field {
 /// - getting layout and metadata for the packed allocation
 /// - using the values to initialize the fresh allocation at the field offset.
 pub unsafe trait Initializer<Field> {
-    /// Computes the required layout and metadata for the field.
-    fn analyze(&self) -> Result<(Layout, Field), LayoutError>;
+    /// Computes the required metadata for the field.
+    /// The actual memory [`Layout`] can be retrieved from [`Field::layout`].
+    fn analyze(&self) -> Result<Field, LayoutError>;
 
     /// Initialize the allocation memory with the content of the initializer.
     ///
@@ -254,12 +268,16 @@ impl<F: Field> Metadata<F> {
     }
 }
 
-fn extend_layout_with_field<F, T: Initializer<F>>(
+fn extend_layout_with_field<F, T>(
     initializer: &T,
     layout: &Layout,
-) -> Result<(Layout, Metadata<F>), LayoutError> {
-    let (field_layout, field) = initializer.analyze()?;
-    let (layout, offset) = layout.extend(field_layout)?;
+) -> Result<(Layout, Metadata<F>), LayoutError>
+where
+    F: Field,
+    T: Initializer<F>,
+{
+    let field = initializer.analyze()?;
+    let (layout, offset) = layout.extend(field.layout())?;
     let metadata = Metadata { offset, field };
     Ok((layout, metadata))
 }
@@ -281,7 +299,7 @@ unsafe impl<T> Field for Slice<T> {
     type Target = [T];
 
     fn layout(&self) -> Layout {
-        // SAFETY: can only be called after a successful Initializer::analyze() + allocation.
+        // SAFETY: Layout was checked in Initializer::analyze()
         unsafe { Layout::array::<T>(self.length).unwrap_unchecked() }
     }
 
@@ -297,17 +315,15 @@ unsafe impl<T, Iter> Initializer<Slice<T>> for Iter
 where
     Iter: std::iter::TrustedLen<Item = T>,
 {
-    fn analyze(&self) -> Result<(Layout, Slice<T>), LayoutError> {
+    fn analyze(&self) -> Result<Slice<T>, LayoutError> {
         // Final allocation is never 0 due to metadata, so no special case.
         // If the iterator exceeds isize::MAX the final allocation would fail so no need for a size check.
         let (lower, _higher) = self.size_hint();
-        let layout = Layout::array::<T>(lower)?;
-
-        let metadata = Slice {
+        let _check_layout_validity = Layout::array::<T>(lower)?;
+        Ok(Slice {
             length: lower,
             _type: PhantomData,
-        };
-        Ok((layout, metadata))
+        })
     }
     unsafe fn initialize(self, field_addr: *mut u8) {
         let mut ptr: *mut T = field_addr.cast();
@@ -332,7 +348,7 @@ unsafe impl Field for Str {
     type Target = str;
 
     fn layout(&self) -> Layout {
-        // SAFETY: can only be called after a successful Initializer::analyze() + allocation.
+        // SAFETY: Layout was checked in Initializer::analyze()
         unsafe { Layout::array::<u8>(self.length).unwrap_unchecked() }
     }
 
@@ -347,14 +363,13 @@ unsafe impl Field for Str {
 }
 
 unsafe impl Initializer<Str> for &'_ str {
-    fn analyze(&self) -> Result<(Layout, Str), LayoutError> {
+    fn analyze(&self) -> Result<Str, LayoutError> {
         let length = self.len();
-        let layout = Layout::array::<u8>(length)?;
-        let metadata = Str {
+        let _check_layout_validity = Layout::array::<u8>(length)?;
+        Ok(Str {
             length,
             _type: PhantomData,
-        };
-        Ok((layout, metadata))
+        })
     }
     unsafe fn initialize(self, field_addr: *mut u8) {
         std::ptr::copy_nonoverlapping(self.as_ptr(), field_addr, self.len())
@@ -402,14 +417,13 @@ where
     Dyn: ?Sized,
     T: std::marker::Unsize<Dyn>,
 {
-    fn analyze(&self) -> Result<(Layout, Unsized<Dyn>), LayoutError> {
-        let layout = Layout::for_value(self);
-        let metadata = std::ptr::metadata(self as &Dyn);
-        let metadata = Unsized {
-            metadata,
+    fn analyze(&self) -> Result<Unsized<Dyn>, LayoutError> {
+        // Not passing the concrete Layout here may force the code to access it through the vtable.
+        // This is for the allocation so not that critical for performance, and compiler may devirtualize the call anyway.
+        Ok(Unsized {
+            metadata: std::ptr::metadata(self as &Dyn),
             _type: PhantomData,
-        };
-        Ok((layout, metadata))
+        })
     }
     unsafe fn initialize(self, field_addr: *mut u8) {
         let ptr: *mut T = field_addr.cast();
@@ -421,9 +435,11 @@ where
 
 #[test]
 fn test() {
-    let b: Box<(Slice<usize>, Unsized<dyn AsRef<str>>)> =
+    let mut b: Box<(Slice<usize>, Unsized<dyn AsRef<str>>)> =
         Box::new(([42, 43].into_iter(), "blah")).unwrap();
     let (slice, string) = b.fields();
     assert_eq!(slice, &[42, 43]);
     assert_eq!(string.as_ref(), "blah");
+    b.fields_mut().0.into_iter().for_each(|i| *i += 1);
+    assert_eq!(b.fields().0, &[43, 44]);
 }
