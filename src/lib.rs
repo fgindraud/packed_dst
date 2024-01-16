@@ -1,23 +1,53 @@
 #![feature(trusted_len)]
 #![feature(ptr_metadata)]
+#![feature(layout_for_ptr)]
 #![feature(unsize)]
 
 use std::alloc::{Layout, LayoutError};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
-pub struct Box<Header, Fields: FieldSequence> {
-    memory: NonNull<Header>,
-    _type: PhantomData<*mut (Header, Fields::Metadata)>,
+pub struct Box<Fields: FieldSequence> {
+    memory: NonNull<Fields::Metadata>,
 }
 
-impl<H, FS: FieldSequence> Box<H, FS> {
-    pub fn new<IS: InitializerSequence<FS>>(header: H, initializers: IS) -> Self {
-        todo!()
+impl<FS: FieldSequence> Box<FS> {
+    pub fn new<IS: InitializerSequence<FS>>(initializers: IS) -> Result<Self, LayoutError> {
+        let (layout, metadata) = initializers.analyze_fields()?;
+        unsafe {
+            let base = std::alloc::alloc(layout);
+            let base = NonNull::new(base).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+            initializers.initialize_fields(base.as_ptr(), &metadata);
+            let memory = base.cast::<FS::Metadata>();
+            memory.as_ptr().write(metadata);
+            Ok(Box { memory })
+        }
     }
 
-    pub fn fields(&self) -> &FS {
-        todo!() // return tuple of refs to fields
+    pub fn fields(&self) -> FS::Ref<'_> {
+        unsafe {
+            let base = self.memory.as_ptr().cast();
+            FS::deref(self.memory.as_ref(), base)
+        }
+    }
+
+    pub fn fields_mut(&mut self) -> FS::RefMut<'_> {
+        unsafe {
+            let base = self.memory.as_ptr().cast();
+            FS::deref_mut(self.memory.as_mut(), base)
+        }
+    }
+}
+
+impl<FS: FieldSequence> Drop for Box<FS> {
+    fn drop(&mut self) {
+        unsafe {
+            let layout = FS::layout(self.memory.as_ref());
+            let base = self.memory.as_ptr().cast();
+            FS::drop_in_place(self.memory.as_mut(), base);
+            std::ptr::drop_in_place(self.memory.as_ptr()); // Metadata block
+            std::alloc::dealloc(base, layout)
+        }
     }
 }
 
@@ -37,6 +67,7 @@ pub unsafe trait FieldSequence {
     where
         Self: 'm;
 
+    fn layout(metadata: &Self::Metadata) -> Layout;
     unsafe fn deref(metadata: &Self::Metadata, base: *const u8) -> Self::Ref<'_>;
     unsafe fn deref_mut(metadata: &mut Self::Metadata, base: *mut u8) -> Self::RefMut<'_>;
     unsafe fn drop_in_place(metadata: &mut Self::Metadata, base: *mut u8);
@@ -44,10 +75,7 @@ pub unsafe trait FieldSequence {
 
 /// Represent a sequence of initializer that can initialize a [`FieldSequence`]
 pub unsafe trait InitializerSequence<Fields: FieldSequence> {
-    fn extend_layout_with_fields(
-        &self,
-        layout: &Layout,
-    ) -> Result<(Layout, Fields::Metadata), LayoutError>;
+    fn analyze_fields(&self) -> Result<(Layout, Fields::Metadata), LayoutError>;
 
     unsafe fn initialize_fields(self, base: *mut u8, metadata: &Fields::Metadata);
 }
@@ -58,6 +86,13 @@ unsafe impl<F: Field> FieldSequence for F {
     type Ref<'m> = &'m F::Target where Self: 'm;
     type RefMut<'m> = &'m mut F::Target where Self: 'm;
 
+    fn layout(metadata: &Self::Metadata) -> Layout {
+        unsafe {
+            let layout = Layout::new::<<F as FieldSequence>::Metadata>();
+            let (layout, _) = layout.extend(metadata.field.layout()).unwrap_unchecked();
+            layout.pad_to_align()
+        }
+    }
     unsafe fn deref(metadata: &Self::Metadata, base: *const u8) -> Self::Ref<'_> {
         metadata.deref(base)
     }
@@ -73,11 +108,10 @@ where
     F: Field,
     T: Initializer<F>,
 {
-    fn extend_layout_with_fields(
-        &self,
-        layout: &Layout,
-    ) -> Result<(Layout, <F as FieldSequence>::Metadata), LayoutError> {
-        extend_layout_with_field(self, layout)
+    fn analyze_fields(&self) -> Result<(Layout, <F as FieldSequence>::Metadata), LayoutError> {
+        let layout = Layout::new::<<F as FieldSequence>::Metadata>();
+        let (layout, metadata) = extend_layout_with_field(self, &layout)?;
+        Ok((layout.pad_to_align(), metadata))
     }
 
     unsafe fn initialize_fields(self, base: *mut u8, metadata: &<F as FieldSequence>::Metadata) {
@@ -91,6 +125,14 @@ unsafe impl<F0: Field, F1: Field> FieldSequence for (F0, F1) {
     type Ref<'m> = (&'m F0::Target, &'m F1::Target) where Self: 'm;
     type RefMut<'m> = (&'m mut F0::Target, &'m mut F1::Target) where Self: 'm;
 
+    fn layout(metadata: &Self::Metadata) -> Layout {
+        unsafe {
+            let layout = Layout::new::<<(F0, F1) as FieldSequence>::Metadata>();
+            let (layout, _) = layout.extend(metadata.0.field.layout()).unwrap_unchecked();
+            let (layout, _) = layout.extend(metadata.1.field.layout()).unwrap_unchecked();
+            layout.pad_to_align()
+        }
+    }
     unsafe fn deref(metadata: &Self::Metadata, base: *const u8) -> Self::Ref<'_> {
         (metadata.0.deref(base), metadata.1.deref(base))
     }
@@ -109,13 +151,13 @@ where
     T0: Initializer<F0>,
     T1: Initializer<F1>,
 {
-    fn extend_layout_with_fields(
+    fn analyze_fields(
         &self,
-        layout: &Layout,
     ) -> Result<(Layout, <(F0, F1) as FieldSequence>::Metadata), LayoutError> {
-        let (layout, metadata0) = extend_layout_with_field(&self.0, layout)?;
+        let layout = Layout::new::<<(F0, F1) as FieldSequence>::Metadata>();
+        let (layout, metadata0) = extend_layout_with_field(&self.0, &layout)?;
         let (layout, metadata1) = extend_layout_with_field(&self.1, &layout)?;
-        Ok((layout, (metadata0, metadata1)))
+        Ok((layout.pad_to_align(), (metadata0, metadata1)))
     }
 
     unsafe fn initialize_fields(
@@ -141,6 +183,9 @@ where
 pub unsafe trait Field {
     /// Type stored in the field, can be a DST : `[T]`, `dyn Trait`.
     type Target: ?Sized;
+
+    /// Field layout from metadata
+    fn layout(&self) -> Layout;
 
     /// Derefs take the metadata by reference to tie the lifetimes of the header to the DST lifetime.
     ///
@@ -235,6 +280,11 @@ pub struct Slice<T> {
 unsafe impl<T> Field for Slice<T> {
     type Target = [T];
 
+    fn layout(&self) -> Layout {
+        // SAFETY: can only be called after a successful Initializer::analyze() + allocation.
+        unsafe { Layout::array::<T>(self.length).unwrap_unchecked() }
+    }
+
     unsafe fn deref(&self, field_addr: *const u8) -> &Self::Target {
         std::slice::from_raw_parts(field_addr.cast(), self.length)
     }
@@ -281,6 +331,11 @@ pub struct Str {
 unsafe impl Field for Str {
     type Target = str;
 
+    fn layout(&self) -> Layout {
+        // SAFETY: can only be called after a successful Initializer::analyze() + allocation.
+        unsafe { Layout::array::<u8>(self.length).unwrap_unchecked() }
+    }
+
     unsafe fn deref(&self, field_addr: *const u8) -> &Self::Target {
         let s = std::slice::from_raw_parts(field_addr, self.length);
         std::str::from_utf8_unchecked(s)
@@ -316,13 +371,21 @@ unsafe impl Initializer<Str> for &'_ str {
 /// - [`str`], but what are the initializers ?
 ///
 /// Initializers are constrained by what the unsize std machinery supports.
-pub struct Unsized<Dyn> {
+pub struct Unsized<Dyn: ?Sized> {
     metadata: <Dyn as std::ptr::Pointee>::Metadata,
     _type: PhantomData<Dyn>,
 }
 
-unsafe impl<Dyn> Field for Unsized<Dyn> {
+unsafe impl<Dyn: ?Sized> Field for Unsized<Dyn> {
     type Target = Dyn;
+
+    fn layout(&self) -> Layout {
+        // SAFETY: metadata has been initialized, and only metadata is needed for Layout::for_value_raw(ptr);
+        unsafe {
+            let dyn_null: *const Dyn = std::ptr::from_raw_parts(std::ptr::null(), self.metadata);
+            Layout::for_value_raw(dyn_null)
+        }
+    }
 
     unsafe fn deref(&self, field_addr: *const u8) -> &Self::Target {
         let ptr = std::ptr::from_raw_parts(field_addr.cast(), self.metadata);
@@ -336,6 +399,7 @@ unsafe impl<Dyn> Field for Unsized<Dyn> {
 
 unsafe impl<Dyn, T> Initializer<Unsized<Dyn>> for T
 where
+    Dyn: ?Sized,
     T: std::marker::Unsize<Dyn>,
 {
     fn analyze(&self) -> Result<(Layout, Unsized<Dyn>), LayoutError> {
@@ -351,4 +415,15 @@ where
         let ptr: *mut T = field_addr.cast();
         ptr.write(self)
     }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+#[test]
+fn test() {
+    let b: Box<(Slice<usize>, Unsized<dyn AsRef<str>>)> =
+        Box::new(([42, 43].into_iter(), "blah")).unwrap();
+    let (slice, string) = b.fields();
+    assert_eq!(slice, &[42, 43]);
+    assert_eq!(string.as_ref(), "blah");
 }
