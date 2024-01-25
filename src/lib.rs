@@ -22,7 +22,7 @@ impl<FS: FieldSequence> Box<FS> {
             let mut header = base.cast::<FS::Metadata>();
             // From there to Box all operations are moves. No panic should occur.
             header.as_ptr().write(metadata);
-            initializers.initialize_fields(base.as_ptr(), header.as_mut());
+            initializers.initialize_fields(header.as_mut(), base.as_ptr());
             Ok(Box {
                 packed_allocation: header,
             })
@@ -99,7 +99,7 @@ pub unsafe trait InitializerSequence<Fields: FieldSequence> {
     /// SAFETY: layout must match with [`FieldSequence::layout`] on the returned metadata.
     fn pack_fields(&self) -> Result<(Layout, Fields::Metadata), LayoutError>;
 
-    unsafe fn initialize_fields(self, base: *mut u8, metadata: &mut Fields::Metadata);
+    unsafe fn initialize_fields(self, metadata: &mut Fields::Metadata, base: *mut u8);
 }
 
 // T
@@ -139,8 +139,8 @@ where
 
     unsafe fn initialize_fields(
         self,
-        base: *mut u8,
         metadata: &mut <F as FieldSequence>::Metadata,
+        base: *mut u8,
     ) {
         metadata.initialize_field(base, self)
     }
@@ -188,8 +188,8 @@ where
 
     unsafe fn initialize_fields(
         self,
-        base: *mut u8,
         metadata: &mut <(F0, F1) as FieldSequence>::Metadata,
+        base: *mut u8,
     ) {
         metadata.0.initialize_field(base, self.0);
         metadata.1.initialize_field(base, self.1)
@@ -233,12 +233,10 @@ pub unsafe trait Initializer<Field> {
     /// Initialize the allocation memory with the content of the initializer.
     ///
     /// SAFETY: `field_addr` must match the layout requirements of [`Self::analyze`].
-    unsafe fn initialize(self, field_addr: *mut u8, descriptor: &mut Field);
+    unsafe fn initialize(self, descriptor: &mut Field, field_addr: *mut u8);
 }
 
 /// Complete metadata for a [`Field`] : ties the field metadata with its offset.
-///
-/// TODO add a First variant with recomputed offset ?
 pub struct Metadata<F> {
     /// Offset of field from base of allocation, in bytes.
     offset: usize,
@@ -258,7 +256,7 @@ impl<F> Metadata<F> {
     // SAFETY: base must have the right layout at offset for initialization.
     unsafe fn initialize_field<T: Initializer<F>>(&mut self, base: *mut u8, initializer: T) {
         let field_addr = base.offset(self.offset());
-        initializer.initialize(field_addr, &mut self.field)
+        initializer.initialize(&mut self.field, field_addr)
     }
 }
 
@@ -293,6 +291,18 @@ where
     let (layout, offset) = layout.extend(field.layout())?;
     let metadata = Metadata { offset, field };
     Ok((layout, metadata))
+}
+
+// TODO move to system with optimized offset storage
+struct UnusedOffset<F> {
+    field: F, // For Sized
+}
+struct StaticOffset<F> {
+    field: F, // First DST field
+}
+struct DynamicOffset<F> {
+    offset: usize, // Other DST fields
+    field: F,
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -332,7 +342,7 @@ unsafe impl<T> Initializer<Sized<T>> for T {
             value: MaybeUninit::uninit(),
         })
     }
-    unsafe fn initialize(self, _field_addr: *mut u8, descriptor: &mut Sized<T>) {
+    unsafe fn initialize(self, descriptor: &mut Sized<T>, _field_addr: *mut u8) {
         descriptor.value.write(self);
     }
 }
@@ -380,7 +390,7 @@ where
             _type: PhantomData,
         })
     }
-    unsafe fn initialize(self, field_addr: *mut u8, descriptor: &mut Slice<T>) {
+    unsafe fn initialize(self, descriptor: &mut Slice<T>, field_addr: *mut u8) {
         let base: *mut T = field_addr.cast();
         let mut ptr = base;
         for v in self {
@@ -428,7 +438,7 @@ unsafe impl Initializer<Str> for &'_ str {
             _type: PhantomData,
         })
     }
-    unsafe fn initialize(self, field_addr: *mut u8, descriptor: &mut Str) {
+    unsafe fn initialize(self, descriptor: &mut Str, field_addr: *mut u8) {
         debug_assert_eq!(descriptor.length, self.len());
         std::ptr::copy_nonoverlapping(self.as_ptr(), field_addr, self.len())
     }
@@ -483,7 +493,7 @@ where
             _type: PhantomData,
         })
     }
-    unsafe fn initialize(self, field_addr: *mut u8, _descriptor: &mut Unsized<Dyn>) {
+    unsafe fn initialize(self, _descriptor: &mut Unsized<Dyn>, field_addr: *mut u8) {
         let ptr: *mut T = field_addr.cast();
         ptr.write(self)
     }
@@ -516,8 +526,5 @@ fn test() {
         sized.layout(),
         Layout::array::<usize>(1 /*offset*/ + 3 /*vec*/).unwrap()
     );
-    assert_eq!(
-        zst.layout(),
-        Layout::array::<usize>(1 /*offset*/).unwrap()
-    )
+    assert_eq!(zst.layout(), Layout::array::<usize>(1 /*offset*/).unwrap())
 }
